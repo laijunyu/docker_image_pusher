@@ -1,1 +1,1 @@
-Skopeo
+hurryos/iptvs-app:latest
