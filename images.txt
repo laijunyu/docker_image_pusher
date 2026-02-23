@@ -1,1 +1,1 @@
-hurryos/iptvs-app:latest
+gdy666/lucky:v2
