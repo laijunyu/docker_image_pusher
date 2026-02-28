@@ -13,7 +13,6 @@ env:
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
 
 jobs:
-
   build:
     name: Pull
     runs-on: ubuntu-latest
@@ -24,9 +23,11 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v2
 
-    - name: Build and push image Aliyun
+    - name: Build and push OCI format image to Aliyun
       run: |
         docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
+        # 创建临时目录存放OCI导出文件
+        mkdir -p ./oci-exports
         while IFS= read -r line; do
           [[ -z "$line" ]] && continue
           echo "docker pull $line"
@@ -38,6 +39,22 @@ jobs:
           new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$image_name_tag"
           echo "docker tag $image $new_image"
           docker tag $image $new_image
+          
+          # 1. 导出镜像为标准OCI格式（保存为tar归档文件）
+          oci_export_file="./oci-exports/${image_name_tag//:/_}.oci.tar"
+          echo "导出镜像 $new_image 为OCI格式到 $oci_export_file"
+          docker save --format oci-archive -o "$oci_export_file" "$new_image"
+          
+          # 2. 先删除原标签镜像（避免冲突）
+          docker rmi "$new_image" || true
+          
+          # 3. 从OCI归档文件加载镜像（确保推送的是OCI格式镜像）
+          echo "从OCI归档加载镜像: $oci_export_file"
+          docker load -i "$oci_export_file"
+          
+          # 4. 推送加载后的OCI格式镜像
           echo "docker push $new_image"
           docker push $new_image
         done < images.txt
+        # 可选：清理临时OCI文件
+        # rm -rf ./oci-exports
