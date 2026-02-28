@@ -1,105 +1,59 @@
-name: Docker Mirror (OCI Format)
+name: Docker
 
-# 触发规则：手动触发 + 主分支推送
 on:
   workflow_dispatch:
   push:
     branches: [ main ]
-    # 仅当images.txt或本配置文件变更时触发（可选优化）
-    paths:
-      - 'images.txt'
-      - '.github/workflows/docker.yaml'
 
-# 环境变量定义（集中管理，符合CI/CD规范）
+
 env:
   ALIYUN_REGISTRY: "${{ secrets.ALIYUN_REGISTRY }}"
-  ALIYUN_NAMESPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
+  ALIYUN_NAME_SPACE: "${{ secrets.ALIYUN_NAME_SPACE }}"
   ALIYUN_REGISTRY_USER: "${{ secrets.ALIYUN_REGISTRY_USER }}"
   ALIYUN_REGISTRY_PASSWORD: "${{ secrets.ALIYUN_REGISTRY_PASSWORD }}"
-  OCI_EXPORT_DIR: "./oci-exports"  # OCI镜像导出目录
 
-# 作业定义
 jobs:
-  mirror-oci-images:
-    name: Pull → Convert to OCI → Push to Aliyun
+
+  build:
+    name: Pull
     runs-on: ubuntu-latest
-    # 设置作业级别权限（最小权限原则）
-    permissions:
-      contents: read  # 仅读取代码仓库内容
-      packages: write # 若推送GitHub Packages需此权限（当前场景可注释）
-
-    # 步骤定义（按CI/CD流程标准化）
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4  # 使用最新稳定版Action
-        with:
-          fetch-depth: 1  # 仅拉取最新提交，优化速度
+    - name: Setup Docker buildx
+      uses: docker/setup-buildx-action@79abd3f86f79a9d68a23c75a09a9a85889262adf
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3  # 最新版Buildx Action
-        with:
-          install: true  # 确保安装最新版buildx，兼容OCI格式
+    - name: Check out code
+      uses: actions/checkout@v2
 
-      - name: Login to Aliyun Container Registry
-        uses: docker/login-action@v3  # 标准化登录Action（替代手动docker login）
-        with:
-          registry: ${{ env.ALIYUN_REGISTRY }}
-          username: ${{ env.ALIYUN_REGISTRY_USER }}
-          password: ${{ env.ALIYUN_REGISTRY_PASSWORD }}
+    - name: Build and push image Aliyun
+      run: |
+        # 安装 Skopeo 工具用于格式转换
+        sudo apt-get update && sudo apt-get install -y skopeo
 
-      - name: Create OCI export directory
-        run: mkdir -p ${{ env.OCI_EXPORT_DIR }}
-        shell: bash
-
-      - name: Process images (Pull → OCI Convert → Push)
-        run: |
-          # 循环处理images.txt中的每个镜像
-          while IFS= read -r image_ref; do
-            # 跳过空行和注释行（增强鲁棒性）
-            [[ -z "$image_ref" || "$image_ref" =~ ^# ]] && continue
-            
-            echo "======================================"
-            echo "Processing image: $image_ref"
-            echo "======================================"
-            
-            # 1. 拉取原始镜像
-            docker pull "$image_ref"
-            
-            # 2. 解析镜像名称和标签（兼容多层级命名）
-            # 提取镜像全量名称（如immortalwrt/rootfs:x86-64-openwrt-21.02.7）
-            full_image_name=$(docker inspect --format '{{.RepoTags}}' "$image_ref" | awk -F'[' '{print $2}' | awk -F']' '{print $1}')
-            # 提取镜像名+标签（如rootfs:x86-64-openwrt-21.02.7）
-            image_name_tag=$(echo "$full_image_name" | awk -F'/' '{print $NF}')
-            # 构建阿里云镜像地址
-            aliyun_image="${{ env.ALIYUN_REGISTRY }}/${{ env.ALIYUN_NAMESPACE }}/$image_name_tag"
-            
-            # 3. 为镜像打阿里云仓库标签
-            docker tag "$image_ref" "$aliyun_image"
-            
-            # 4. 转换为OCI格式并导出（兼容低版本Docker）
-            oci_file="${{ env.OCI_EXPORT_DIR }}/${image_name_tag//:/_}.oci.tar"
-            echo "Exporting OCI format to: $oci_file"
-            docker buildx build --output type=oci,dest="$oci_file" --tag "$aliyun_image" - <<EOF
-          FROM $aliyun_image
-          EOF
-            
-            # 5. 删除本地原标签镜像（避免冲突）
-            docker rmi "$aliyun_image" || true
-            
-            # 6. 加载OCI格式镜像
-            echo "Loading OCI image from: $oci_file"
-            docker load -i "$oci_file"
-            
-            # 7. 推送OCI格式镜像到阿里云
-            echo "Pushing OCI image to Aliyun: $aliyun_image"
-            docker push "$aliyun_image"
-            
-            echo "✅ Completed processing: $image_ref"
-          done < images.txt
-        shell: bash
-
-      # 可选：清理临时文件（优化存储空间）
-      - name: Cleanup OCI files
-        if: always()  # 无论前序步骤是否失败都执行
-        run: rm -rf ${{ env.OCI_EXPORT_DIR }}
-        shell: bash
+        docker login -u $ALIYUN_REGISTRY_USER -p $ALIYUN_REGISTRY_PASSWORD $ALIYUN_REGISTRY
+        while IFS= read -r line; do
+          [[ -z "$line" ]] && continue
+          echo "docker pull $line"
+          docker pull $line
+          # 获取镜像的完整名称，例如kasmweb/nginx:1.25.3（命名空间/镜像名:版本号）
+          image=$(echo "$line" | awk '{print $NF}')
+          # 获取 镜像名:版本号  例如nginx:1.25.3
+          image_name_tag=$(echo "$image" | awk -F'/' '{print $NF}')
+          new_image="$ALIYUN_REGISTRY/$ALIYUN_NAME_SPACE/$image_name_tag"
+          echo "docker tag $image $new_image"
+          docker tag $image $new_image
+          
+          # === 新增代码：将 Docker 镜像转换为 OCI 格式 ===
+          echo "Converting $image to OCI format..."
+          # 清理旧的临时目录（如果存在）
+          rm -rf ./oci_tmp_image
+          # 从 Docker Daemon 导出并转换为 OCI 目录格式
+          skopeo copy docker-daemon:$image oci:./oci_tmp_image
+          
+          # === 修改代码：推送刚刚转换的 OCI 镜像 ===
+          echo "Pushing OCI image to $new_image"
+          # 使用 skopeo 将本地 OCI 目录推送到远程仓库
+          skopeo copy --dest-creds $ALIYUN_REGISTRY_USER:$ALIYUN_REGISTRY_PASSWORD oci:./oci_tmp_image docker://$new_image
+          
+          # 清理临时文件
+          rm -rf ./oci_tmp_image
+        done < images.txt
